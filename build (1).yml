@@ -1,0 +1,719 @@
+# WTCI TV: builds an installable Android TV / Fire TV / tablet app (APK)
+# from the index.html in the repo root.
+#
+# Put this file at  .github/workflows/build.yml
+# Every time you upload a new index.html the app is rebuilt automatically
+# (Actions tab > latest run > Artifacts > wtci-tv-apk).
+
+name: Build WTCI TV app
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Write the Android project
+        run: |
+          set -e
+          test -f index.html || { echo "::error::index.html is missing from the repo root"; exit 1; }
+          rm -rf tv
+          mkdir -p tv tv/app tv/app/src/main tv/app/src/main/assets tv/app/src/main/java/com/wtci/tv tv/app/src/main/res/drawable-xhdpi tv/app/src/main/res/mipmap-xxhdpi tv/app/src/main/res/values
+          cat > tv/settings.gradle <<'WTCI_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = 'WTCI-TV'
+          include ':app'
+          WTCI_EOF
+          cat > tv/build.gradle <<'WTCI_EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          WTCI_EOF
+          cat > tv/gradle.properties <<'WTCI_EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=false
+          android.nonTransitiveRClass=true
+          WTCI_EOF
+          cat > tv/app/build.gradle <<'WTCI_EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          // The build number from GitHub (1, 2, 3 ...) so each new build counts as an update.
+          def buildNumber = (project.findProperty('vCode') ?: '1').toString().toInteger()
+
+          android {
+              namespace = 'com.wtci.tv'
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = 'com.wtci.tv'
+                  minSdk = 23
+                  targetSdk = 34
+                  versionCode = buildNumber
+                  versionName = "1.0." + buildNumber
+              }
+
+              // One fixed signing key so every new build installs OVER the old one
+              // (keeps your profiles, lists and watch history).
+              signingConfigs {
+                  stable {
+                      storeFile file('wtci.keystore')
+                      storePassword 'wtci-tv-key'
+                      keyAlias 'wtci'
+                      keyPassword 'wtci-tv-key'
+                  }
+              }
+
+              buildTypes {
+                  debug {
+                      signingConfig signingConfigs.stable
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          WTCI_EOF
+          cat > tv/app/src/main/AndroidManifest.xml <<'WTCI_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+              <!-- TVs have no touchscreen; without these the app is hidden from TV installs -->
+              <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+              <uses-feature android:name="android.software.leanback" android:required="false" />
+
+              <application
+                  android:label="WTCI"
+                  android:icon="@mipmap/ic_launcher"
+                  android:banner="@drawable/banner"
+                  android:theme="@style/AppTheme"
+                  android:allowBackup="false"
+                  android:hardwareAccelerated="true"
+                  android:usesCleartextTraffic="true">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:screenOrientation="sensorLandscape"
+                      android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <!-- phones / tablets -->
+                          <category android:name="android.intent.category.LAUNCHER" />
+                          <!-- Android TV + Fire TV home screen -->
+                          <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          WTCI_EOF
+          cat > tv/app/src/main/res/values/styles.xml <<'WTCI_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="android:Theme.Material.NoActionBar">
+                  <item name="android:windowBackground">@android:color/black</item>
+                  <item name="android:windowFullscreen">true</item>
+                  <item name="android:statusBarColor">@android:color/black</item>
+                  <item name="android:navigationBarColor">@android:color/black</item>
+              </style>
+          </resources>
+          WTCI_EOF
+          cat > tv/app/src/main/java/com/wtci/tv/MainActivity.java <<'WTCI_EOF'
+          package com.wtci.tv;
+
+          import android.app.Activity;
+          import android.app.UiModeManager;
+          import android.content.Context;
+          import android.content.pm.PackageManager;
+          import android.content.res.Configuration;
+          import android.graphics.Color;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.os.SystemClock;
+          import android.util.DisplayMetrics;
+          import android.view.KeyEvent;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.view.WindowManager;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebResourceResponse;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.widget.FrameLayout;
+          import android.widget.Toast;
+
+          import java.io.ByteArrayInputStream;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.util.HashMap;
+
+          public class MainActivity extends Activity {
+
+              /**
+               * Extra border around the page on TVs, as a percent of the screen on each side.
+               * Some TVs crop the edges (overscan). Set to 0 to turn it off.
+               */
+              private static final float TV_BORDER_PERCENT = 2.0f;
+
+              private static final int BG = Color.parseColor("#09090b");
+
+              // The app is served from a fake https origin so fetch/CORS, localStorage and
+              // the YouTube trailer referrer behave like a normal website.
+              private static final String HOST = "appassets.androidplatform.net";
+              private static final String START_URL = "https://" + HOST + "/index.html";
+
+              // Added to the WebView user agent so the page can switch on its TV styles.
+              private static final String UA_TAG = " WTCITV";
+
+              // Sends a "GoBack" key press to the page. Returns "ok" if the wtci page is
+              // loaded (so it handled Back), otherwise "no" and we just close the app.
+              private static final String BACK_JS =
+                      "(function(){try{"
+                      + "if(!document.getElementById('side'))return 'no';"
+                      + "var e=new KeyboardEvent('keydown',{key:'GoBack',code:'GoBack',keyCode:4,which:4,"
+                      + "bubbles:true,cancelable:true});"
+                      + "document.dispatchEvent(e);return 'ok';"
+                      + "}catch(x){return 'no';}})()";
+
+              private WebView web;
+              private long lastExitTap = 0;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+
+                  FrameLayout root = new FrameLayout(this);
+                  root.setBackgroundColor(BG);
+
+                  web = new WebView(this);
+                  web.setBackgroundColor(BG);
+
+                  FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
+                  if (isTv() && TV_BORDER_PERCENT > 0) {
+                      DisplayMetrics dm = getResources().getDisplayMetrics();
+                      int mx = Math.round(dm.widthPixels * TV_BORDER_PERCENT / 100f);
+                      int my = Math.round(dm.heightPixels * TV_BORDER_PERCENT / 100f);
+                      lp.setMargins(mx, my, mx, my);
+                  }
+                  root.addView(web, lp);
+                  setContentView(root);
+
+                  WebSettings s = web.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setDatabaseEnabled(true);
+                  s.setMediaPlaybackRequiresUserGesture(false);
+                  s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+                  s.setSupportZoom(false);
+                  s.setBuiltInZoomControls(false);
+                  s.setUseWideViewPort(true);
+                  s.setLoadWithOverviewMode(true);
+                  s.setAllowFileAccess(false);
+                  s.setAllowContentAccess(false);
+                  s.setUserAgentString(s.getUserAgentString() + UA_TAG);
+
+                  web.setOverScrollMode(View.OVER_SCROLL_NEVER);
+                  web.setHorizontalScrollBarEnabled(false);
+                  web.setVerticalScrollBarEnabled(false);
+                  web.setFocusable(true);
+                  web.setFocusableInTouchMode(true);
+                  web.addJavascriptInterface(new Bridge(), "WTCI");
+
+                  web.setWebChromeClient(new WebChromeClient());
+                  web.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                          WebResourceResponse res = serveAsset(request.getUrl());
+                          return res != null ? res : super.shouldInterceptRequest(view, request);
+                      }
+
+                      @Override
+                      public void onPageFinished(WebView view, String url) {
+                          view.requestFocus();
+                      }
+                  });
+
+                  web.loadUrl(START_URL);
+                  web.requestFocus();
+              }
+
+              /** Page -> app calls. Only used to quit when Back is pressed on the home screen. */
+              private class Bridge {
+                  @JavascriptInterface
+                  public void exit() {
+                      runOnUiThread(new Runnable() {
+                          @Override
+                          public void run() {
+                              confirmExit();
+                          }
+                      });
+                  }
+              }
+
+              private void confirmExit() {
+                  long now = SystemClock.uptimeMillis();
+                  if (now - lastExitTap < 2000) {
+                      finish();
+                      return;
+                  }
+                  lastExitTap = now;
+                  Toast.makeText(this, "Press Back again to exit", Toast.LENGTH_SHORT).show();
+              }
+
+              /** Serve files from app/src/main/assets as if they lived on HOST. */
+              private WebResourceResponse serveAsset(Uri uri) {
+                  if (uri == null || !HOST.equals(uri.getHost())) return null;
+                  String path = uri.getPath();
+                  if (path == null || path.length() <= 1) path = "/index.html";
+                  try {
+                      InputStream in = getAssets().open(path.substring(1));
+                      return new WebResourceResponse(mimeFor(path), "utf-8", in);
+                  } catch (IOException e) {
+                      return new WebResourceResponse("text/plain", "utf-8", 404, "Not Found",
+                              new HashMap<String, String>(), new ByteArrayInputStream(new byte[0]));
+                  }
+              }
+
+              private static String mimeFor(String path) {
+                  String p = path.toLowerCase();
+                  if (p.endsWith(".html") || p.endsWith(".htm")) return "text/html";
+                  if (p.endsWith(".js")) return "application/javascript";
+                  if (p.endsWith(".css")) return "text/css";
+                  if (p.endsWith(".json")) return "application/json";
+                  if (p.endsWith(".png")) return "image/png";
+                  if (p.endsWith(".jpg") || p.endsWith(".jpeg")) return "image/jpeg";
+                  if (p.endsWith(".svg")) return "image/svg+xml";
+                  if (p.endsWith(".webp")) return "image/webp";
+                  return "application/octet-stream";
+              }
+
+              private boolean isTv() {
+                  UiModeManager um = (UiModeManager) getSystemService(Context.UI_MODE_SERVICE);
+                  if (um != null && um.getCurrentModeType() == Configuration.UI_MODE_TYPE_TELEVISION) return true;
+                  PackageManager pm = getPackageManager();
+                  return pm.hasSystemFeature("android.software.leanback")
+                          || pm.hasSystemFeature("amazon.hardware.fire_tv");
+              }
+
+              // ---- Back button -------------------------------------------------------
+              // WebView never hands the remote's Back key to JavaScript, so we do it.
+
+              private void sendBackToPage() {
+                  web.evaluateJavascript(BACK_JS, new ValueCallback<String>() {
+                      @Override
+                      public void onReceiveValue(String value) {
+                          if (!"\"ok\"".equals(value)) finish();
+                      }
+                  });
+              }
+
+              @Override
+              public boolean dispatchKeyEvent(KeyEvent event) {
+                  if (event.getKeyCode() == KeyEvent.KEYCODE_BACK) {
+                      if (event.getAction() == KeyEvent.ACTION_UP && !event.isCanceled()) sendBackToPage();
+                      return true;
+                  }
+                  return super.dispatchKeyEvent(event);
+              }
+
+              @Override
+              public void onBackPressed() {
+                  // Gesture / on-screen Back (tablets)
+                  sendBackToPage();
+              }
+
+              // ---- Full screen / lifecycle -------------------------------------------
+
+              @Override
+              public void onWindowFocusChanged(boolean hasFocus) {
+                  super.onWindowFocusChanged(hasFocus);
+                  if (hasFocus) {
+                      getWindow().getDecorView().setSystemUiVisibility(
+                              View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                                      | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                                      | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                                      | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                                      | View.SYSTEM_UI_FLAG_FULLSCREEN
+                                      | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
+                  }
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  web.onResume();
+              }
+
+              @Override
+              protected void onPause() {
+                  web.onPause();
+                  super.onPause();
+              }
+
+              @Override
+              protected void onDestroy() {
+                  if (web != null) {
+                      web.destroy();
+                  }
+                  super.onDestroy();
+              }
+          }
+          WTCI_EOF
+          base64 -d > tv/app/src/main/res/drawable-xhdpi/banner.png <<'WTCI_B64'
+          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
+          WTCI_B64
+          base64 -d > tv/app/src/main/res/mipmap-xxhdpi/ic_launcher.png <<'WTCI_B64'
+          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
+          SUVORK5CYII=
+          WTCI_B64
+          base64 -d > tv/app/wtci.keystore <<'WTCI_B64'
+          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
+          WTCI_B64
+          cp index.html tv/app/src/main/assets/index.html
+          if [ -n "${ANDROID_HOME:-}" ]; then echo "sdk.dir=$ANDROID_HOME" > tv/local.properties; fi
+
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Build the app
+        working-directory: tv
+        run: gradle assembleDebug -PvCode=${{ github.run_number }} --no-daemon --stacktrace
+
+      - name: Collect the APK
+        run: cp tv/app/build/outputs/apk/debug/app-debug.apk wtci-tv.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wtci-tv-apk
+          path: wtci-tv.apk
+          retention-days: 30
